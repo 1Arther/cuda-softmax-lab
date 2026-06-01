@@ -1,28 +1,40 @@
 # CUDA Softmax Kernel Lab
 
-本项目是一个用于学习和验证 **CUDA Row-wise Softmax 算子优化** 的小型实验项目。
+本项目从零实现并测试了多种 **CUDA Row-wise Softmax** 及 Attention 中常见的 Softmax 变体，重点覆盖：
 
-项目实现了多个 Softmax kernel 版本，并在不同矩阵形状下进行 benchmark，对比各版本的正确性、执行时间、有效带宽和加速比。
+- 普通 Row-wise Softmax
+- Warp-level reduction 优化
+- One-warp-per-row 短序列优化
+- Float4 向量化访存
+- `__expf` 快速指数函数
+- Scaled Masked Softmax
+- Scaled Causal Softmax
 
-测试环境：
+这些算子是 Transformer Attention 中的核心组成部分，可作为继续实现 **Unfused Attention / FlashAttention 简化版** 的基础。
+
+---
+
+## 1. 项目文件
 
 ```text
-GPU: NVIDIA A40
-SM count: 84
+.
+├── main.cu          # CPU reference、correctness check、benchmark
+├── softmax_row.cu   # CUDA softmax kernels
+└── README.md
 ```
 
 ---
 
-## 1. 项目目标
+## 2. Row-wise Softmax
 
-本项目主要关注二维矩阵的行级 Softmax：
+输入输出形状：
 
 ```text
 input:  [M, N]
 output: [M, N]
 ```
 
-对每一行独立计算：
+每一行独立计算 softmax：
 
 ```text
 softmax(x_i) = exp(x_i - max(x)) / sum_j exp(x_j - max(x))
@@ -32,120 +44,61 @@ softmax(x_i) = exp(x_i - max(x)) / sum_j exp(x_j - max(x))
 
 ---
 
-## 2. 已实现版本
+## 3. 已实现 Kernel
 
-目前实现了以下几个 CUDA kernel：
-
-| 版本 | Kernel                        | 核心思想                                                     |
-| ---- | ----------------------------- | ------------------------------------------------------------ |
-| v1   | `softmax_naive_kernel`        | 一个 block 处理一行，shared memory 做 block reduce           |
-| v2   | `softmax_warp_kernel`         | 一个 block 处理一行，warp-level reduce 减少 shared memory 访问 |
-| v3   | `softmax_warp_per_row_kernel` | 一个 warp 处理一行，适合短 row                               |
-| v4   | `softmax_vec4_kernel`         | `float4` 向量化读写，提升 global memory 访问效率             |
-| v5   | `softmax_vec4_fast_kernel`    | `float4 + __expf`，测试 fast math 对性能的影响               |
-| v6   | `launch_dispatch`             | 根据 N 的大小自动选择 kernel                                 |
-
----
-
-## 3. 编译方式
-
-A40 对应 `sm_86`：
-
-```bash
-nvcc -O3 -arch=sm_86 main.cu softmax_row.cu -o softmax_bench
-```
-
-运行：
-
-```bash
-./softmax_bench
-```
-
-如果是 Ada 架构 GPU，例如 RTX 4090 / L40，可以改成：
-
-```bash
-nvcc -O3 -arch=sm_89 main.cu softmax_row.cu -o softmax_bench
-```
+| 版本 | Kernel                              | 核心思想                                                     |
+| ---- | ----------------------------------- | ------------------------------------------------------------ |
+| v1   | `softmax_naive_kernel`              | 一个 block 处理一行，shared memory 做 block-level reduction  |
+| v2   | `softmax_warp_kernel`               | 一个 block 处理一行，warp shuffle reduce + shared memory 汇总 |
+| v3   | `softmax_warp_per_row_kernel`       | 一个 warp 处理一行，适合短 row                               |
+| v4   | `softmax_vec4_kernel`               | 使用 `float4` 向量化读写                                     |
+| v5   | `softmax_vec4_fast_kernel`          | `float4 + __expf`，测试快速指数函数                          |
+| v6   | `launch_dispatch`                   | 根据 `N` 自动选择 kernel                                     |
+| v7   | `scaled_masked_softmax_warp_kernel` | 支持 `scale` 和显式 mask                                     |
+| v8   | `scaled_causal_softmax_warp_kernel` | 支持 decoder self-attention 中的 causal mask                 |
 
 ---
 
-## 4. Benchmark 方法
+## 4. 普通 Softmax 优化路线
 
-每个 kernel 都使用相同的 benchmark 流程：
+### 4.1 Naive Softmax
 
-1. 生成随机输入。
-2. CPU 端计算 reference softmax。
-3. CUDA kernel 计算输出。
-4. 对比 CPU reference，计算最大绝对误差。
-5. 检查每一行 softmax 输出和是否接近 1。
-6. 进行 warmup。
-7. 使用 `cudaEvent` 计时，多次 repeat 后取平均时间。
-8. 估算有效带宽。
-
-有效带宽近似按下面的访存量估计：
-
-```text
-traffic ≈ 5 * M * N * sizeof(float)
-```
-
-对应当前实现中的主要访存：
-
-```text
-1. 读 input 求 row max
-2. 读 input 计算 exp
-3. 写 output 保存 exp 中间结果
-4. 读 output 做 normalize
-5. 写 output 保存最终 softmax
-```
-
-这个带宽只是一个近似指标，主要用于横向比较不同 kernel。
-
----
-
-## 5. Kernel 设计说明
-
-### 5.1 naive shared-memory 版本
-
-`softmax_naive_kernel` 使用一个 block 处理一行。
+`softmax_naive_kernel` 使用一个 CUDA block 处理一行。
 
 流程：
 
 ```text
-1. 每个线程 stride 遍历当前行的一部分元素，得到 local max
-2. shared memory 做 block reduce，得到 row max
+1. 每个线程 stride 遍历当前行，得到 local max
+2. shared memory reduction 得到 row max
 3. 每个线程计算 exp(x - max)，并累加 local sum
-4. shared memory 做 block reduce，得到 row sum
+4. shared memory reduction 得到 row sum
 5. 每个线程将 output 除以 row sum
 ```
 
-特点：
-
-- 实现简单。
-- 使用 shared memory 和 `__syncthreads()` 完成 block 内归约。
-- 同步和 shared memory 访问开销相对较大。
+优点是结构清楚，适合作为 baseline。缺点是 shared memory 访问和 `__syncthreads()` 较多。
 
 ---
 
-### 5.2 warp-level block reduce 版本
+### 4.2 Warp-level Softmax
 
-`softmax_warp_kernel` 仍然是一个 block 处理一行，但是先在 warp 内用 `__shfl_down_sync` 做规约。
+`softmax_warp_kernel` 仍然是一个 block 处理一行，但使用 `__shfl_down_sync` 做 warp 内 reduction。
 
-归约结构：
+归约流程：
 
 ```text
 thread local result
-→ warp reduce
-→ 每个 warp 的 lane 0 写 shared memory
-→ 第一个 warp 归约所有 warp 的结果
-→ 写回 smem[0]
-→ 全 block 读取最终结果
+-> warp reduce
+-> 每个 warp 的 lane 0 写入 shared memory
+-> 第一个 warp reduce 所有 warp partial result
+-> 写回 smem[0]
+-> 全 block 读取最终结果
 ```
 
-相比 naive 版本，它减少了 shared memory reduce 的开销。
+相比 naive 版本，它减少了 shared memory 访问和 block-level synchronization。
 
 ---
 
-### 5.3 one-warp-per-row 版本
+### 4.3 One-warp-per-row Softmax
 
 `softmax_warp_per_row_kernel` 使用一个 warp 处理一行。
 
@@ -159,36 +112,44 @@ thread local result
 
 优点：
 
-- 不需要 shared memory。
-- 不需要 block-level `__syncthreads()`。
-- 短 row 场景下开销更小。
+```text
+1. 不需要 shared memory
+2. 不需要 block-level __syncthreads()
+3. 短 row 场景下开销低
+```
 
 缺点：
 
-- 一行只有 32 个线程处理。
-- 当 N 较大时，单行并行度不足，性能明显下降。
+```text
+1. 一行只有 32 个线程处理
+2. 当 N 较大时，单行并行度不足
+```
 
-实验结果显示，该版本主要适合 `N <= 128` 的短行场景。
+因此它更适合：
+
+```text
+N <= 128
+```
 
 ---
 
-### 5.4 float4 向量化版本
+### 4.4 Float4 Vectorized Softmax
 
 `softmax_vec4_kernel` 使用 `float4` 进行向量化读写。
 
-原本每次处理一个 float：
+普通标量读写：
 
 ```cpp
 float x = row_input[i];
 ```
 
-向量化后每次处理四个 float：
+向量化后：
 
 ```cpp
 float4 v = row_input4[i];
 ```
 
-这样可以减少 global memory load/store 指令数量，提高访存效率。
+每个线程一次处理 4 个连续 float，可以减少访存指令数量，提高 global memory load/store 效率。
 
 该版本要求：
 
@@ -196,18 +157,11 @@ float4 v = row_input4[i];
 N % 4 == 0
 ```
 
-原因是：
-
-```text
-cudaMalloc 返回的起始地址通常是高对齐的；
-但每一行起始地址 input + row * N 是否 16-byte 对齐，取决于 N 是否是 4 的倍数。
-```
-
-因此 dispatch 中只有当 `N % 4 == 0` 时才使用 vec4 kernel，否则 fallback 到普通 warp 版本。
+因为需要保证每一行起始地址能够按 `float4` 对齐访问。
 
 ---
 
-### 5.5 vec4 + __expf 版本
+### 4.5 Float4 + `__expf`
 
 `softmax_vec4_fast_kernel` 将：
 
@@ -221,21 +175,11 @@ expf(x)
 __expf(x)
 ```
 
-`__expf` 是 CUDA 提供的快速近似指数函数，理论上可以降低指数计算开销，但精度略低。
-
-本项目中额外 benchmark 了该版本，用来观察 fast exponential 对 Softmax 的影响。
-
-当前实验结果显示：
-
-- `__expf` 版本正确性正常。
-- 输出误差仍在 `1e-8` 量级。
-- 但性能相比普通 `vec4` 版本提升很小，很多场景基本持平。
-
-因此默认 dispatch 暂时仍使用普通 `vec4` 版本，而不是 `vec4_fast`。
+`__expf` 是 CUDA 的快速近似指数函数，可能更快，但精度略低。当前实验中，`__expf` 的正确性正常，但速度相比普通 `expf` 基本持平。
 
 ---
 
-## 6. Dispatch 策略
+## 5. Dispatch 策略
 
 当前自动选择策略：
 
@@ -251,64 +195,264 @@ if (N <= 128) {
 
 设计原因：
 
-- `N <= 128` 时，one-warp-per-row 可以减少 shared memory 和同步开销。
-- 中等和较大 N 时，一个 block 处理一行能提供更高单行并行度。
+- `N <= 128` 时，one-warp-per-row 可以减少同步和 shared memory 开销。
+- 中等和较大 `N` 时，一个 block 处理一行能提供更高单行并行度。
 - 当 `N % 4 == 0` 时，优先使用 `float4` 向量化版本。
-- `vec4_fast` 虽然被 benchmark，但默认不用于 dispatch，因为收益不稳定。
 
 ---
 
-## 7. A40 Benchmark 结果
+## 6. Scaled Masked Softmax
+
+Attention 中常用的形式不是普通 softmax，而是：
+
+```text
+softmax(score * scale + mask)
+```
+
+其中：
+
+```text
+scale = 1 / sqrt(head_dim)
+```
+
+显式 mask 的语义：
+
+```text
+mask[i] != 0: 当前位置有效
+mask[i] == 0: 当前位置被屏蔽
+```
+
+实现时不需要真的给 masked 位置加 `-inf`，而是在 max 和 sum 两个 reduction 阶段直接跳过 masked 位置。
+
+语义：
+
+```text
+if valid:
+    output[i] = exp(input[i] * scale - max_valid) / sum_valid
+else:
+    output[i] = 0
+```
+
+核心判断：
+
+```cpp
+bool valid = (row_mask == nullptr) || (row_mask[i] != 0);
+```
+
+其中 `mask == nullptr` 表示没有 mask，所有位置都有效。
+
+---
+
+## 7. Scaled Causal Softmax
+
+Causal Softmax 是 decoder self-attention 中使用的 mask。它保证当前位置不能看到未来 token：
+
+```text
+key index <= query index
+```
+
+实现中不需要显式构造 causal mask 矩阵，只需要根据列号判断：
+
+```cpp
+bool valid = i <= q;
+```
+
+其中：
+
+```cpp
+int q = row % query_len;
+```
+
+原因是 attention scores 通常是：
+
+```text
+scores: [B, H, Q, K]
+```
+
+为了做 row-wise softmax，会展平成：
+
+```text
+scores: [B * H * Q, K]
+```
+
+因此每一行对应一个 query。对于展平后的 row：
+
+```text
+q = row % query_len
+```
+
+可以恢复当前 query 在序列中的位置。
+
+例如：
+
+```text
+B = 2, H = 1, query_len = 4, key_len = 4
+M = B * H * query_len = 8
+N = key_len = 4
+```
+
+|  row | q = row % query_len | 可见 key   |
+| ---: | ------------------: | ---------- |
+|    0 |                   0 | 0          |
+|    1 |                   1 | 0, 1       |
+|    2 |                   2 | 0, 1, 2    |
+|    3 |                   3 | 0, 1, 2, 3 |
+|    4 |                   0 | 0          |
+|    5 |                   1 | 0, 1       |
+|    6 |                   2 | 0, 1, 2    |
+|    7 |                   3 | 0, 1, 2, 3 |
+
+Causal mask 矩阵形状：
+
+```text
+1 0 0 0
+1 1 0 0
+1 1 1 0
+1 1 1 1
+```
+
+---
+
+## 8. 编译与运行
+
+测试 GPU 为 NVIDIA A40，编译命令如下：
+
+```bash
+nvcc -O3 -std=c++17 -arch=sm_86 main.cu softmax_row.cu -o softmax_bench
+./softmax_bench
+```
+
+如果是 Ada 架构 GPU，例如 RTX 4090 / L40，可以使用：
+
+```bash
+nvcc -O3 -std=c++17 -arch=sm_89 main.cu softmax_row.cu -o softmax_bench
+./softmax_bench
+```
+
+---
+
+## 9. Benchmark 方法
+
+每个 kernel 使用相同流程：
+
+```text
+1. 生成随机输入
+2. CPU 端计算 reference softmax
+3. CUDA kernel 计算输出
+4. 对比 CPU reference，计算最大绝对误差
+5. 检查每一行 softmax 输出和是否接近 1
+6. warmup
+7. 使用 cudaEvent 计时，多次 repeat 后取平均时间
+8. 估算有效带宽
+```
+
+普通 softmax 的理论访存量近似为：
+
+```text
+traffic ≈ 5 * M * N * sizeof(float)
+```
+
+对应当前实现：
+
+```text
+1. 读 input 求 row max
+2. 读 input 计算 exp
+3. 写 output 保存 exp 中间结果
+4. 读 output 做 normalize
+5. 写 output 保存最终 softmax
+```
+
+Masked softmax 额外读取 mask：
+
+```text
+masked_traffic ≈ 5 * M * N * sizeof(float) + 2 * M * N * sizeof(uint8_t)
+```
+
+注意：README 中的 GB/s 是根据理论访存量估算的 **effective bandwidth**，不是 Nsight Compute 直接测得的 DRAM throughput。
+
+---
+
+## 10. 实验环境
+
+```text
+GPU: NVIDIA A40
+SM count: 84
+```
+
+---
+
+## 11. Row-wise Softmax Benchmark
 
 代表性结果如下：
 
-|    M |     N | naive ms | warp ms | warp_row ms | vec4 ms | vec4_fast ms | auto ms | 最优加速比 |
-| ---: | ----: | -------: | ------: | ----------: | ------: | -----------: | ------: | ---------: |
-|  128 |    64 |   0.0029 |  0.0030 |      0.0028 |  0.0031 |       0.0031 |  0.0028 |     1.047x |
-|  128 |   128 |   0.0029 |  0.0030 |      0.0028 |  0.0031 |       0.0031 |  0.0028 |     1.040x |
-|  128 |   512 |   0.0038 |  0.0034 |      0.0048 |  0.0033 |       0.0033 |  0.0033 |     1.160x |
-|  128 |  1024 |   0.0045 |  0.0041 |      0.0073 |  0.0036 |       0.0036 |  0.0036 |     1.255x |
-|  512 |  1024 |   0.0084 |  0.0071 |      0.0075 |  0.0058 |       0.0058 |  0.0058 |     1.455x |
-| 1024 |  1024 |   0.0185 |  0.0181 |      0.0234 |  0.0139 |       0.0139 |  0.0139 |     1.332x |
-| 1024 |  4096 |   0.1323 |  0.1326 |      0.1861 |  0.1254 |       0.1252 |  0.1252 |     1.057x |
-|  256 | 50000 |   0.5548 |  0.5552 |      1.8059 |  0.4812 |       0.4811 |  0.4809 |     1.154x |
+|    M |     N | naive ms | warp ms | warp_row ms | vec4 ms | vec4_fast ms | auto ms | best speedup |
+| ---: | ----: | -------: | ------: | ----------: | ------: | -----------: | ------: | -----------: |
+|  128 |    64 |   0.0029 |  0.0030 |      0.0029 |  0.0031 |       0.0031 |  0.0029 |       1.000x |
+|  128 |   128 |   0.0029 |  0.0030 |      0.0029 |  0.0031 |       0.0031 |  0.0029 |       1.014x |
+|  128 |   512 |   0.0038 |  0.0034 |      0.0048 |  0.0033 |       0.0033 |  0.0033 |       1.163x |
+|  128 |  1024 |   0.0045 |  0.0041 |      0.0073 |  0.0036 |       0.0036 |  0.0036 |       1.256x |
+|  512 |  1024 |   0.0084 |  0.0070 |      0.0075 |  0.0058 |       0.0058 |  0.0058 |       1.460x |
+| 1024 |  1024 |   0.0184 |  0.0181 |      0.0233 |  0.0138 |       0.0139 |  0.0138 |       1.329x |
+| 1024 |  4096 |   0.1322 |  0.1325 |      0.1861 |  0.1253 |       0.1250 |  0.1252 |       1.058x |
+|  256 | 50000 |   0.5549 |  0.5552 |      1.8050 |  0.4810 |       0.4811 |  0.4807 |       1.154x |
 
 正确性：
 
 ```text
-max absolute error: 约 1e-8
-row sum error:      约 1e-6 到 1e-5
+max absolute error: around 1e-8
+row sum error:      around 1e-7 to 1e-5
 ```
 
 ---
 
-## 8. 实验结论
+## 12. Scaled Masked / Causal Softmax Benchmark
 
-### 8.1 one-warp-per-row 只适合短 row
+|    M |    N | masked ms | causal ms | masked GB/s | causal GB/s | masked err | causal err | masked zero err | causal zero err |
+| ---: | ---: | --------: | --------: | ----------: | ----------: | ---------: | ---------: | --------------: | --------------: |
+|  128 |   64 |    0.0033 |    0.0031 |       54.83 |       53.33 |   1.49e-08 |   2.98e-08 |        0.00e+00 |        0.00e+00 |
+|  128 |  128 |    0.0033 |    0.0032 |      108.31 |      103.56 |   7.45e-09 |   2.98e-08 |        0.00e+00 |        0.00e+00 |
+|  256 |  256 |    0.0041 |    0.0036 |      352.00 |      366.76 |   5.59e-09 |   2.98e-08 |        0.00e+00 |        0.00e+00 |
+|  512 |  512 |    0.0065 |    0.0056 |      881.38 |      932.60 |   4.66e-09 |   2.98e-08 |        0.00e+00 |        0.00e+00 |
+| 1024 | 1024 |    0.0230 |    0.0134 |     1002.58 |     1568.15 |   2.56e-09 |   2.98e-08 |        0.00e+00 |        0.00e+00 |
+| 2048 |  512 |    0.0217 |    0.0147 |     1061.14 |     1430.17 |   4.19e-09 |   4.47e-08 |        0.00e+00 |        0.00e+00 |
+| 4096 | 1024 |    0.0726 |    0.0473 |     1270.97 |     1772.01 |   3.49e-09 |   5.96e-08 |        0.00e+00 |        0.00e+00 |
 
-当 `N = 64 / 128` 时，该版本略快，因为它避免了 shared memory 和 block 级同步。
+说明：
 
-但当 N 变大后，它明显变慢。原因是每一行只有 32 个线程处理，单行并行度不足。
+- `masked_zeroerr = 0` 表示 masked 位置输出严格为 0。
+- `causal_zeroerr = 0` 表示未来 token 位置输出严格为 0。
+- `causal_ms` 通常小于 `masked_ms`，因为 causal mask 不需要读取显式 mask tensor，只需要根据列号判断 `i <= q`。
 
 ---
 
-### 8.2 warp-level block reduction 收益有限
+## 13. 实验结论
 
-相比 naive shared-memory reduce，warp-level block reduce 减少了一部分同步和 shared memory 访问。
+### 13.1 One-warp-per-row 适合短 row
 
-但 Softmax 的主要开销还包括：
+当 `N = 64 / 128` 时，one-warp-per-row 版本表现较好，因为它避免了 shared memory 和 block-level synchronization。
+
+但当 `N` 变大后，它明显变慢。例如 `N = 50000` 时，one-warp-per-row 只有一个 warp 处理一行，单行并行度严重不足。
+
+---
+
+### 13.2 Warp-level block reduction 收益有限
+
+相比 naive shared-memory reduction，warp-level block reduction 减少了一部分同步和 shared memory 访问。
+
+但 Softmax 仍然有以下开销：
 
 ```text
-global memory 读写
-expf 指数计算
-多轮 row 遍历
+1. 多次 global memory 访问
+2. expf 指数计算
+3. 两次 row-level reduction
+4. 多轮 row 遍历
 ```
 
-所以 warp reduce 的收益是有限且 shape-dependent 的。
+所以 warp reduce 的收益是 shape-dependent 的。
 
 ---
 
-### 8.3 float4 是当前最有效的优化
+### 13.3 Float4 是当前最有效的普通 Softmax 优化
 
 `float4` 向量化版本在中等 row length 上提升明显。
 
@@ -316,50 +460,73 @@ expf 指数计算
 
 ```text
 M = 512, N = 1024
-naive:    0.0084 ms
-vec4fast: 0.0058 ms
-speedup:  1.455x
+naive:     0.0084 ms
+vec4_fast: 0.0058 ms
+speedup:   1.460x
 ```
 
 说明向量化访存可以有效减少 global memory load/store 指令开销。
 
 ---
 
-### 8.4 __expf 收益不明显
+### 13.4 `__expf` 收益不明显
 
-`vec4_fast` 使用 `__expf` 替代 `expf`。
+`__expf` 理论上可以加速指数计算，但当前实验中相比普通 `expf` 提升很小，很多场景基本持平。
 
-实验显示：
-
-- 正确性正常。
-- 性能和普通 `vec4` 版本基本接近。
-- 说明当前 shape 下瓶颈不完全是指数函数本身，还受到访存、调度和整体 kernel 结构影响。
+可能原因是当前 kernel 仍然受到多轮访存、同步和 reduction 开销影响，单独替换指数函数并不能显著改变整体性能。
 
 ---
 
-## 9. 文件结构
+### 13.5 Masked / Causal Softmax 更贴近 Attention
+
+普通 Softmax 是基础版本，但 Attention 中更常见的是：
 
 ```text
-.
-├── main.cu
-└── softmax_row.cu
+scaled masked softmax
+scaled causal softmax
 ```
 
-其中：
+这两个版本的关键不是最后把无效位置置 0，而是要在 **max 和 sum reduction 阶段就排除无效位置**。否则被 mask 的大值仍然会影响 softmax 的数值结果。
+
+---
+
+## 14. 面试讲法
+
+可以这样介绍这个项目：
 
 ```text
-main.cu        benchmark、CPU reference、正确性验证、dispatch 测试
-softmax_row.cu CUDA Softmax kernel 实现
+我实现了 row-wise softmax 的多个 CUDA 版本，包括 naive shared-memory reduction、
+warp-level reduction、one-warp-per-row、float4 vectorized、float4 + __expf，以及 dispatch 策略。
+
+普通 softmax 中，每一行先 reduce max，再计算 exp 和 reduce sum，最后 normalize。
+为了数值稳定，计算 exp 前会减去 row max。
+
+对于 attention softmax，我进一步实现了 scaled masked softmax 和 scaled causal softmax。
+scale 来自 1 / sqrt(head_dim)，用于控制 QK 点积的数值范围。
+
+masked softmax 不直接对无效位置加 -inf，而是在 max 和 sum reduction 阶段跳过无效位置，
+最后 masked 位置输出 0。
+
+causal softmax 用于 decoder self-attention，核心判断是 key index <= query index。
+在 scores 展平成 [B * H * query_len, key_len] 后，可以通过 row % query_len 恢复当前 query index。
 ```
 
 ---
 
-## 10. 面试表达总结
+## 15. 后续方向
 
-这个项目可以这样介绍：
+下一步可以继续实现：
 
-> 我实现了一个 row-wise Softmax CUDA benchmark，包括 shared-memory block reduce、warp-level reduce、one-warp-per-row、float4 向量化、fast exponential 和 shape-based dispatch 多个版本。
->
-> 实验发现 one-warp-per-row 只适合短 row；中等和大 row 更适合 block-per-row；float4 向量化在部分 shape 下可以获得 1.1x 到 1.45x 左右加速；而 __expf 在当前测试中收益不明显。
->
-> 这个项目主要训练了我对 CUDA row-wise 算子、warp reduce、all-reduce、vectorized load/store、数值稳定性和 benchmark 方法的理解。
+```text
+1. Unfused Attention Forward: QK^T + scaled causal softmax + P @ V
+2. Tiled QK^T
+3. Online Softmax
+4. Simplified FlashAttention
+```
+
+FlashAttention 的核心思想是：
+
+```text
+不显式落地完整 S x S attention matrix，
+而是在 tile 内完成 QK、online softmax 和 PV 累加。
+```

@@ -328,3 +328,149 @@ __global__ void softmax_vec4_fast_kernel(const float* input, float* output, int 
         row_output4[i]=v;
     }
 }
+
+__global__ void scaled_masked_softmax_warp_kernel(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ mask,
+    float* __restrict__ output,
+    int M,
+    int N,
+    float scale
+){
+    int tid=threadIdx.x;
+    int row=blockIdx.x;
+    if(row>=M) return;
+    const float* row_input =input+row*N;
+    float* row_output=output+row*N;
+    const unsigned char* row_mask=nullptr;
+    if(mask!=nullptr){
+        row_mask=mask+row*N;
+    }
+    int warpId=tid/warpSize;
+    int laneId=tid%warpSize;
+    extern __shared__ float smem[];
+    
+    float max=-FLT_MAX;
+    for(int i=tid;i<N;i+=blockDim.x){
+        bool valid=(row_mask==nullptr) || (row_mask[i]!=0);
+        if(valid){
+            max=fmaxf(max,row_input[i]*scale);
+        }
+    }
+    max=reduce_max(max);
+    if(laneId==0){
+        smem[warpId]=max;
+    }
+    __syncthreads();
+    if(warpId==0){
+        int num=(blockDim.x+warpSize-1)/warpSize;
+        max=(laneId<num)?smem[laneId]:-FLT_MAX;
+        max=reduce_max(max);
+    }
+    if(tid==0){
+        smem[0]=max;
+    }
+    __syncthreads();
+    max=smem[0];
+    float sum=0.0f;
+    for(int i=tid;i<N;i+=blockDim.x){
+        bool valid=(row_mask==nullptr) || (row_mask[i]!=0);
+        if(!valid){
+            row_output[i]=0;
+        }else{
+            float e=expf(row_input[i]*scale-max);
+            row_output[i]=e;
+            sum+=e;
+        }
+    }
+    sum=reduce_sum(sum);
+    if(laneId==0){
+        smem[warpId]=sum;
+    }
+    __syncthreads();
+    if(warpId==0){
+        int num=(blockDim.x+warpSize-1)/warpSize;
+        sum=(laneId<num)?smem[laneId]:0.0f;
+        sum=reduce_sum(sum);
+    }
+    if(tid==0){
+        smem[0]=sum;
+    }
+    __syncthreads();
+    sum=smem[0];
+    float inv_sum=sum>0.0f?1.0f/sum:0.0f;
+    for(int i=tid;i<N;i+=blockDim.x){
+        row_output[i]=row_output[i]*inv_sum;
+    }
+}
+
+__global__ void scaled_causal_softmax_warp_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int M,
+    int N,
+    int query_len,
+    float scale
+){
+    int tid=threadIdx.x;
+    int row=blockIdx.x;
+    if(row>=M) return;
+    const float* row_input =input+row*N;
+    float* row_output=output+row*N;
+    int warpId=tid/warpSize;
+    int laneId=tid%warpSize;
+    extern __shared__ float smem[];
+    int q=row % query_len;
+    float max=-FLT_MAX;
+    for(int i=tid;i<N;i+=blockDim.x){
+        bool valid= i<=q;
+        if(valid){
+            max=fmaxf(max,row_input[i]*scale);
+        }
+    }
+    max=reduce_max(max);
+    if(laneId==0){
+        smem[warpId]=max;
+    }
+    __syncthreads();
+    if(warpId==0){
+        int num=(blockDim.x+warpSize-1)/warpSize;
+        max=(laneId<num)?smem[laneId]:-FLT_MAX;
+        max=reduce_max(max);
+    }
+    if(tid==0){
+        smem[0]=max;
+    }
+    __syncthreads();
+    max=smem[0];
+    float sum=0.0f;
+    for(int i=tid;i<N;i+=blockDim.x){
+        bool valid= i<=q;
+        if(!valid){
+            row_output[i]=0;
+        }else{
+            float e=expf(row_input[i]*scale-max);
+            row_output[i]=e;
+            sum+=e;
+        }
+    }
+    sum=reduce_sum(sum);
+    if(laneId==0){
+        smem[warpId]=sum;
+    }
+    __syncthreads();
+    if(warpId==0){
+        int num=(blockDim.x+warpSize-1)/warpSize;
+        sum=(laneId<num)?smem[laneId]:0.0f;
+        sum=reduce_sum(sum);
+    }
+    if(tid==0){
+        smem[0]=sum;
+    }
+    __syncthreads();
+    sum=smem[0];
+    float inv_sum=sum>0.0f?1.0f/sum:0.0f;
+    for(int i=tid;i<N;i+=blockDim.x){
+        row_output[i]=row_output[i]*inv_sum;
+    }
+}
